@@ -1,0 +1,76 @@
+{
+    "id": "PRODAFTUstaIoCUploadIndicators",
+    "title": "PRODAFT USTA - IoC Threat Intelligence",
+    "publisher": "PRODAFT",
+    "descriptionMarkdown": "The PRODAFT USTA IoC Threat Intelligence connector ingests indicators of compromise (malicious URLs, malware hashes, and phishing sites) from the PRODAFT USTA platform into Microsoft Sentinel's Threat Intelligence as STIX indicators via the Upload STIX Objects API. Ingestion is performed by the import playbooks shipped with this solution (one per IoC feed); indicators appear in the Threat Intelligence blade and in the `ThreatIntelIndicators` table with `SourceSystem == 'PRODAFT USTA'`. After installing the solution, deploy and authorize the import playbooks by following the guidance in the Manage solution view.",
+    "graphQueries": [
+        {
+            "metricName": "Total indicators received",
+            "legend": "PRODAFT USTA indicators",
+            "baseQuery": "ThreatIntelIndicators | where SourceSystem == 'PRODAFT USTA'"
+        }
+    ],
+    "sampleQueries": [
+        {
+            "description": "All PRODAFT USTA indicators",
+            "query": "ThreatIntelIndicators | where SourceSystem == 'PRODAFT USTA' | sort by TimeGenerated desc"
+        },
+        {
+            "description": "PRODAFT USTA indicators by type",
+            "query": "ThreatIntelIndicators | where SourceSystem == 'PRODAFT USTA' | extend IndicatorType = replace(@'\\[|\\]|\\\"', '', tostring(split(ObservableKey, ':', 0))) | summarize count() by IndicatorType"
+        }
+    ],
+    "dataTypes": [
+        {
+            "name": "ThreatIntelIndicators",
+            "lastDataReceivedQuery": "ThreatIntelIndicators | where isnotempty(TimeGenerated) and SourceSystem == 'PRODAFT USTA' | summarize Time = max(TimeGenerated)"
+        }
+    ],
+    "connectivityCriterias": [
+        {
+            "type": "IsConnectedQuery",
+            "value": [
+                "ThreatIntelIndicators | where SourceSystem == 'PRODAFT USTA' | summarize LastLogReceived = max(TimeGenerated) | project IsConnected = LastLogReceived > ago(30d)"
+            ]
+        }
+    ],
+    "availability": {
+        "status": 1,
+        "isPreview": false
+    },
+    "permissions": {
+        "resourceProvider": [
+            {
+                "provider": "Microsoft.SecurityInsights/threatintelligence/write",
+                "permissionsDisplayText": "read and write permissions to Microsoft Sentinel threat intelligence are required.",
+                "providerDisplayName": "Workspace",
+                "scope": "Workspace",
+                "requiredPermissions": {
+                    "write": true,
+                    "read": true,
+                    "delete": true
+                }
+            }
+        ],
+        "customs": [
+            {
+                "name": "PRODAFT USTA API key",
+                "description": "A long-lived PRODAFT USTA API key with access to the Security Intelligence IoC endpoints is required."
+            }
+        ]
+    },
+    "instructionSteps": [
+        {
+            "title": "1. Install the core Threat Intelligence solution",
+            "description": "This connector lands indicators in the `ThreatIntelIndicators` table and the Threat Intelligence blade. Install the Microsoft **Threat Intelligence** solution from the Content hub first, so the blade and the source-agnostic TI-map analytic rules are available."
+        },
+        {
+            "title": "2. Deploy the PRODAFT USTA import playbooks",
+            "description": "This solution ships three import playbooks — **PRODAFTUstaIoC-ImportMaliciousUrls**, **PRODAFTUstaIoC-ImportMalwareHashes**, and **PRODAFTUstaIoC-ImportPhishingSites** — plus an on-demand **PRODAFTUstaIoC-Backfill** playbook. Deploy them from the Manage solution view (or the Automation blade), supplying your USTA base URL, USTA API key, and the Log Analytics workspace ID."
+        },
+        {
+            "title": "3. Authorize the playbooks' managed identity",
+            "description": "Each import playbook uses a system-assigned managed identity to call the Upload STIX Objects API. Grant that identity the **Microsoft Sentinel Contributor** role on the workspace (Log Analytics workspace → Access control (IAM) → Add role assignment). Once granted, the playbooks poll USTA hourly and push new indicators; the connector shows **Connected** after the first indicators arrive."
+        }
+    ]
+}

@@ -1,0 +1,109 @@
+# PRODAFTUstaIoC-ImportPhishingSites
+
+Hourly import playbook for the **phishing-sites** USTA IoC feed. It polls a sliding window
+of new records, maps each to a STIX 2.1 indicator, and uploads them to Microsoft Sentinel
+Threat Intelligence (Upload STIX Objects API) using its **system-assigned managed identity**.
+The feed has no expiry, so a validity window (`ValidityDays`, default 7) is synthesized from
+each site's `created` date. Indicators appear in the Threat Intelligence blade /
+`ThreatIntelIndicators` table with `SourceSystem == "PRODAFT USTA"`.
+
+## Parameters
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `PlaybookName` | no | `PRODAFTUstaIoC-ImportPhishingSites` | Logic App name. |
+| `UstaBaseUrl` | no | `https://usta.prodaft.com` | USTA API base URL. |
+| `UstaApiKey` | **yes** | — | USTA long-lived API key (secured). |
+| `WorkspaceID` | **yes** | — | Log Analytics **workspace ID (GUID)** — workspace → *Overview*. |
+| `LookBackHours` | no | `2` | Sliding window fetched each run (small overlap over the hourly schedule; re-uploads are idempotent). |
+| `ValidityDays` | no | `7` | Validity window applied from each site's `created` date (the feed has no expiry). |
+
+## Deploy — from the portal
+
+1. **Microsoft Sentinel → Content hub → PRODAFT USTA - IoC Threat Intelligence → Manage → Playbook templates**, select **PRODAFT USTA - Import Phishing Sites**, choose **Create playbook**, and supply `UstaApiKey` and `WorkspaceID`. (Or **Automation → Create → Playbook**, then deploy this `azuredeploy.json`.)
+2. The playbook is created with a **system-assigned managed identity** automatically.
+3. **Grant the role** (required for the upload): open the **Log Analytics workspace → Access control (IAM) → Add → Add role assignment** → Role **Microsoft Sentinel Contributor** → **Members: Managed identity** → pick this Logic App by name → **Review + assign**.
+4. It now runs hourly. To run immediately, open the Logic App → **Run Trigger → Recurrence**.
+
+## Deploy — via Azure CLI (run from this folder)
+
+```bash
+# ---- configuration ----
+SUB="<subscription-id>"
+RG="<resource-group>"                 # resource group of the Sentinel workspace
+WS="<workspace-name>"                  # Log Analytics workspace name
+WORKSPACE_ID="<workspace-guid>"        # workspace ID (GUID), from workspace Overview
+USTA_API_KEY="<usta-api-key>"
+PLAYBOOK="PRODAFTUstaIoC-ImportPhishingSites"
+
+az account set --subscription "$SUB"
+
+# 1. Deploy the playbook and capture its managed-identity principalId
+PRINCIPAL_ID=$(az deployment group create \
+  --resource-group "$RG" \
+  --template-file azuredeploy.json \
+  --parameters PlaybookName="$PLAYBOOK" \
+               UstaApiKey="$USTA_API_KEY" \
+               WorkspaceID="$WORKSPACE_ID" \
+  --query properties.outputs.playbookPrincipalId.value -o tsv)
+
+# 2. Grant that identity 'Microsoft Sentinel Contributor' on the workspace
+az role assignment create \
+  --assignee-object-id "$PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Microsoft Sentinel Contributor" \
+  --scope "/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.OperationalInsights/workspaces/$WS"
+
+# 3. (Optional) run once now instead of waiting for the hourly schedule
+az rest --method POST \
+  --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Logic/workflows/$PLAYBOOK/triggers/Recurrence/run?api-version=2016-10-01"
+```
+
+> **RBAC propagation:** the role assignment in step 2 can take a minute to take effect. If the
+> first run shows 403 on the Upload STIX Objects action, wait a moment and run the trigger again.
+
+## Verify
+
+```kql
+ThreatIntelIndicators
+| where SourceSystem == "PRODAFT USTA"
+| where TimeGenerated > ago(1h)
+| sort by TimeGenerated desc
+| take 20
+```
+
+## Troubleshooting — `401 UnauthorizedAccess` on Upload STIX Objects
+
+If the run fails at the **Upload STIX Objects** action with:
+
+```
+UnauthorizedAccess: The Object ID [<object-id>] does not have required permission
+to perform this action on the workspace [<workspace-guid>].
+```
+
+the playbook's **system-assigned managed identity** does not (yet) hold **Microsoft Sentinel
+Contributor** on that workspace. The request body is fine — this is purely the role
+assignment (step 2 above) not being effective for **this** identity.
+
+1. Treat the **Object ID in the error message as authoritative** — that is the identity that
+   must get the role. Confirm it matches the Logic App's identity: **Logic App → Identity →
+   System assigned → Object (principal) ID**. (Redeploying with the same playbook name keeps
+   this id; deleting and recreating the playbook changes it, so re-grant after a recreate.)
+2. Grant the role to that exact object id, scoped to the workspace named in the error
+   (resolve the name from its GUID with
+   `az monitor log-analytics workspace list -g "$RG" --query "[?customerId=='<workspace-guid>'].name"`):
+
+   ```bash
+   az role assignment create \
+     --assignee-object-id "<object-id>" \
+     --assignee-principal-type ServicePrincipal \
+     --role "Microsoft Sentinel Contributor" \
+     --scope "/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.OperationalInsights/workspaces/$WS"
+   ```
+3. Data-plane RBAC for the threat-intelligence API can take **5–15 minutes** to propagate.
+   Wait, then re-run the trigger. Verify with
+   `az role assignment list --assignee "<object-id>" --all -o table`.
+
+Common causes: the role was assigned to a **different identity** (wrong playbook, or a
+recreated one), at the **wrong scope** (a different workspace / resource group), or it simply
+**hasn't propagated** yet.
