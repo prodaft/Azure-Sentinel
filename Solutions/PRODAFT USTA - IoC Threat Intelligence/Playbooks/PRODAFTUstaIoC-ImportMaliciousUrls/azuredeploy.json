@@ -3,7 +3,7 @@
   "contentVersion": "1.0.0.0",
   "metadata": {
     "title": "PRODAFT USTA - Import Malicious URLs",
-    "description": "Polls the PRODAFT USTA malicious-URL IoC feed hourly, maps each record to a STIX 2.1 indicator, and uploads it to Microsoft Sentinel Threat Intelligence via the Upload STIX Objects API. Indicators appear in the Threat Intelligence blade and the ThreatIntelIndicators table with SourceSystem 'PRODAFT USTA'. Re-uploads are idempotent (deterministic STIX ids), so the sliding poll window is safe.",
+    "description": "Polls the PRODAFT USTA malicious-URL IoC feed hourly, maps each record to a STIX 2.1 indicator, and uploads it to Microsoft Sentinel Threat Intelligence via the Upload STIX Objects API. Indicators appear in the Threat Intelligence blade and the ThreatIntelIndicators table with SourceSystem 'PRODAFT USTA - Malicious URLs'. Each run starts its fetch window from a watermark - the newest already-imported indicator's created time, read from the ThreatIntelIndicators table - so a failed run does not advance the window and no records are skipped; re-uploads are idempotent (deterministic STIX ids). The watermark query and the upload both use the playbook's managed identity and the same 'Microsoft Sentinel Contributor' role.",
     "prerequisites": [
       "1. A PRODAFT USTA long-lived API key with access to the Security Intelligence IoC endpoints.",
       "2. The Log Analytics workspace ID (GUID) of the Microsoft Sentinel workspace.",
@@ -46,7 +46,7 @@
     "LookBackHours": {
       "type": "int",
       "defaultValue": 2,
-      "metadata": { "description": "Sliding window (hours) fetched on each run. Keep a small overlap over the hourly recurrence; re-uploads are idempotent." }
+      "metadata": { "description": "First-run / fallback look-back window (hours), used only when no PRODAFT USTA indicator has been imported yet (empty watermark). On subsequent runs the fetch window starts from the import watermark instead." }
     }
   },
   "variables": {
@@ -102,15 +102,45 @@
             }
           },
           "actions": {
+            "Get_Import_Watermark": {
+              "type": "Http",
+              "runAfter": {},
+              "inputs": {
+                "method": "POST",
+                "uri": "https://api.loganalytics.io/v1/workspaces/@{parameters('WorkspaceID')}/query",
+                "headers": { "Content-Type": "application/json" },
+                "body": {
+                  "query": "@{concat('ThreatIntelIndicators | where SourceSystem == ''PRODAFT USTA - Malicious URLs'' | summarize MaxCreated = max(Created) | extend StartTime = coalesce(MaxCreated, ago(', string(parameters('LookBackHours')), 'h)) - 5m | project StartTime')}"
+                },
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://api.loganalytics.io"
+                },
+                "retryPolicy": { "type": "exponential", "count": 3, "interval": "PT20S" }
+              }
+            },
             "Initialize_NextUrl": {
               "type": "InitializeVariable",
-              "runAfter": {},
+              "runAfter": { "Get_Import_Watermark": [ "Succeeded" ] },
               "inputs": {
                 "variables": [
                   {
                     "name": "NextUrl",
                     "type": "string",
-                    "value": "@{concat(parameters('UstaBaseUrl'), '/api/threat-stream/v4/security-intelligence/ioc/malicious-urls?ordering=created&size=100&start=', encodeUriComponent(addHours(utcNow(), mul(-1, parameters('LookBackHours')), 'yyyy-MM-ddTHH:mm:ssZ')))}"
+                    "value": "@{concat(parameters('UstaBaseUrl'), '/api/threat-stream/v4/security-intelligence/ioc/malicious-urls?ordering=created&size=100&start=', encodeUriComponent(formatDateTime(body('Get_Import_Watermark')?['tables']?[0]?['rows']?[0]?[0], 'yyyy-MM-ddTHH:mm:ssZ')))}"
+                  }
+                ]
+              }
+            },
+            "Initialize_FetchFailed": {
+              "type": "InitializeVariable",
+              "runAfter": { "Initialize_NextUrl": [ "Succeeded" ] },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "FetchFailed",
+                    "type": "boolean",
+                    "value": false
                   }
                 ]
               }
@@ -119,7 +149,7 @@
               "type": "Until",
               "expression": "@empty(variables('NextUrl'))",
               "limit": { "count": 1000, "timeout": "PT1H" },
-              "runAfter": { "Initialize_NextUrl": [ "Succeeded" ] },
+              "runAfter": { "Initialize_FetchFailed": [ "Succeeded" ] },
               "actions": {
                 "Fetch_USTA_Page": {
                   "type": "Http",
@@ -136,67 +166,121 @@
                     "retryPolicy": { "type": "exponential", "count": 3, "interval": "PT20S" }
                   }
                 },
-                "If_Page_Has_Records": {
+                "Check_Fetch_Response": {
                   "type": "If",
-                  "runAfter": { "Update_NextUrl": [ "Succeeded" ] },
+                  "runAfter": { "Fetch_USTA_Page": [ "Succeeded", "Failed", "TimedOut" ] },
                   "expression": {
                     "and": [
-                      { "greater": [ "@length(coalesce(body('Fetch_USTA_Page')?['results'], json('[]')))", 0 ] }
+                      { "equals": [ "@coalesce(outputs('Fetch_USTA_Page')?['statusCode'], 0)", 200 ] }
                     ]
                   },
                   "actions": {
-                    "Map_To_STIX": {
-                      "type": "Select",
+                    "Update_NextUrl": {
+                      "type": "SetVariable",
                       "runAfter": {},
                       "inputs": {
-                        "from": "@body('Fetch_USTA_Page')?['results']",
-                        "select": {
-                          "type": "indicator",
-                          "spec_version": "2.1",
-                          "pattern_type": "stix",
-                          "id": "@concat('indicator--', item()?['id'])",
-                          "name": "@item()?['url']",
-                          "description": "@concat('PRODAFT USTA - Malicious URL. Host: ', coalesce(item()?['host'], ''))",
-                          "pattern": "@if(or(startsWith(item()?['url'], 'http://'), startsWith(item()?['url'], 'https://')), concat('[url:value = ''', item()?['url'], ''']'), if(equals(item()?['is_domain'], true), concat('[domain-name:value = ''', item()?['host'], ''']'), concat('[url:value = ''http://', item()?['url'], ''']')))",
-                          "indicator_types": [ "malicious-activity" ],
-                          "labels": "@if(empty(item()?['tags']), json('[\"Malicious\"]'), item()?['tags'])",
-                          "confidence": 85,
-                          "valid_from": "@item()?['valid_from']",
-                          "valid_until": "@item()?['valid_until']",
-                          "created": "@item()?['created']",
-                          "modified": "@utcNow()",
-                          "object_marking_refs": [ "marking-definition--f88d31f6-486f-44da-b317-01333bde0b82" ]
-                        }
+                        "name": "NextUrl",
+                        "value": "@coalesce(body('Fetch_USTA_Page')?['next'], '')"
                       }
                     },
-                    "Upload_STIX_Objects": {
-                      "type": "ApiConnection",
-                      "runAfter": { "Map_To_STIX": [ "Succeeded" ] },
-                      "inputs": {
-                        "host": {
-                          "connection": { "name": "@parameters('$connections')['azuresentinel']['connectionId']" }
+                    "If_Page_Has_Records": {
+                      "type": "If",
+                      "runAfter": { "Update_NextUrl": [ "Succeeded" ] },
+                      "expression": {
+                        "and": [
+                          { "greater": [ "@length(coalesce(body('Fetch_USTA_Page')?['results'], json('[]')))", 0 ] }
+                        ]
+                      },
+                      "actions": {
+                        "Map_To_STIX": {
+                          "type": "Select",
+                          "runAfter": {},
+                          "inputs": {
+                            "from": "@body('Fetch_USTA_Page')?['results']",
+                            "select": {
+                              "type": "indicator",
+                              "spec_version": "2.1",
+                              "pattern_type": "stix",
+                              "id": "@concat('indicator--', item()?['id'])",
+                              "name": "@item()?['url']",
+                              "description": "@concat('PRODAFT USTA - Malicious URL. Host: ', coalesce(item()?['host'], ''))",
+                              "pattern": "@if(or(startsWith(item()?['url'], 'http://'), startsWith(item()?['url'], 'https://')), concat('[url:value = ''', item()?['url'], ''']'), if(equals(item()?['is_domain'], true), concat('[domain-name:value = ''', item()?['host'], ''']'), concat('[url:value = ''http://', item()?['url'], ''']')))",
+                              "indicator_types": [ "malicious-activity" ],
+                              "labels": "@if(empty(item()?['tags']), json('[\"Malicious\"]'), item()?['tags'])",
+                              "confidence": 85,
+                              "valid_from": "@item()?['valid_from']",
+                              "valid_until": "@item()?['valid_until']",
+                              "created": "@item()?['created']",
+                              "modified": "@utcNow()",
+                              "object_marking_refs": [ "marking-definition--f88d31f6-486f-44da-b317-01333bde0b82" ]
+                            }
+                          }
                         },
-                        "method": "post",
-                        "body": {
-                          "stixobjects": "@body('Map_To_STIX')",
-                          "sourcesystem": "PRODAFT USTA"
-                        },
-                        "path": "/ThreatIntelligence/@{encodeURIComponent(uriComponent(parameters('WorkspaceID')))}/UploadStixObjects/",
-                        "retryPolicy": { "type": "exponential", "count": 3, "interval": "PT20S" }
-                      }
+                        "Upload_STIX_Objects": {
+                          "type": "ApiConnection",
+                          "runAfter": { "Map_To_STIX": [ "Succeeded" ] },
+                          "inputs": {
+                            "host": {
+                              "connection": { "name": "@parameters('$connections')['azuresentinel']['connectionId']" }
+                            },
+                            "method": "post",
+                            "body": {
+                              "stixobjects": "@body('Map_To_STIX')",
+                              "sourcesystem": "PRODAFT USTA - Malicious URLs"
+                            },
+                            "path": "/ThreatIntelligence/@{encodeURIComponent(uriComponent(parameters('WorkspaceID')))}/UploadStixObjects/",
+                            "retryPolicy": { "type": "exponential", "count": 3, "interval": "PT20S" }
+                          }
+                        }
+                      },
+                      "else": { "actions": {} }
                     }
                   },
-                  "else": { "actions": {} }
-                },
-                "Update_NextUrl": {
-                  "type": "SetVariable",
-                  "runAfter": { "Fetch_USTA_Page": [ "Succeeded", "Failed", "Skipped", "TimedOut" ] },
-                  "inputs": {
-                    "name": "NextUrl",
-                    "value": "@coalesce(body('Fetch_USTA_Page')?['next'], '')"
+                  "else": {
+                    "actions": {
+                      "Mark_Fetch_Failed": {
+                        "type": "SetVariable",
+                        "runAfter": {},
+                        "inputs": {
+                          "name": "FetchFailed",
+                          "value": true
+                        }
+                      },
+                      "Stop_Paging": {
+                        "type": "SetVariable",
+                        "runAfter": { "Mark_Fetch_Failed": [ "Succeeded" ] },
+                        "inputs": {
+                          "name": "NextUrl",
+                          "value": ""
+                        }
+                      }
+                    }
                   }
                 }
               }
+            },
+            "Fail_If_Fetch_Failed": {
+              "type": "If",
+              "runAfter": { "Until_All_Pages_Processed": [ "Succeeded" ] },
+              "expression": {
+                "and": [
+                  { "equals": [ "@variables('FetchFailed')", true ] }
+                ]
+              },
+              "actions": {
+                "Terminate_Run_As_Failed": {
+                  "type": "Terminate",
+                  "runAfter": {},
+                  "inputs": {
+                    "runStatus": "Failed",
+                    "runError": {
+                      "code": "UstaFetchFailed",
+                      "message": "The 'Fetch USTA Page' request did not return HTTP 200 (for example, HTTP 403 when the USTA API key lacks the required Security Intelligence IoC permissions). Failing the run so the error is not silently reported as success. Verify the USTA API key permissions and re-run."
+                    }
+                  }
+                }
+              },
+              "else": { "actions": {} }
             }
           },
           "outputs": {}

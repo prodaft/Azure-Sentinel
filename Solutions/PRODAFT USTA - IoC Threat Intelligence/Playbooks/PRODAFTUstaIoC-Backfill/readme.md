@@ -2,11 +2,14 @@
 
 On-demand backfill playbook for the **PRODAFT USTA - IoC Threat Intelligence** solution.
 
-The import playbooks only poll **forward** from their sliding window. This playbook loads
+The import playbooks only poll **forward** from a per-feed watermark. This playbook loads
 history: it pages a chosen USTA IoC feed over a historical window, maps each record to a
 STIX 2.1 indicator, and uploads it to Microsoft Sentinel Threat Intelligence via the same
-**Upload STIX Objects** action used by the import playbooks. Re-uploads are idempotent
-(deterministic STIX ids), so running it more than once is safe.
+**Upload STIX Objects** action used by the import playbooks. Indicators are written under the
+same per-feed `SourceSystem` as the importer (`PRODAFT USTA - Malicious URLs`, `… - Malware
+Hashes`, or `… - Phishing Sites`), so backfilled history unifies with the incremental data and
+is picked up by that feed's watermark. Re-uploads are idempotent (deterministic STIX ids), so
+running it more than once is safe.
 
 ## Parameters
 
@@ -70,7 +73,7 @@ Verify results:
 
 ```kql
 ThreatIntelIndicators
-| where SourceSystem == "PRODAFT USTA"
+| where SourceSystem startswith "PRODAFT USTA"
 | sort by TimeGenerated desc
 | take 20
 ```

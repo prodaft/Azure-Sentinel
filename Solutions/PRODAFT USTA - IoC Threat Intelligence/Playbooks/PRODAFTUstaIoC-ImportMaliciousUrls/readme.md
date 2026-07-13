@@ -1,10 +1,22 @@
 # PRODAFTUstaIoC-ImportMaliciousUrls
 
-Hourly import playbook for the **malicious-URLs** USTA IoC feed. It polls a sliding window
-of new records, maps each to a STIX 2.1 indicator, and uploads them to Microsoft Sentinel
-Threat Intelligence (Upload STIX Objects API) using its **system-assigned managed identity**.
-Indicators appear in the Threat Intelligence blade / `ThreatIntelIndicators` table with
-`SourceSystem == "PRODAFT USTA"`.
+Hourly import playbook for the **malicious-URLs** USTA IoC feed. Each run resumes from a
+**watermark** — the newest already-imported indicator's `created` time — maps each new record
+to a STIX 2.1 indicator, and uploads them to Microsoft Sentinel Threat Intelligence (Upload
+STIX Objects API) using its **system-assigned managed identity**. Indicators appear in the
+Threat Intelligence blade / `ThreatIntelIndicators` table with `SourceSystem == "PRODAFT USTA - Malicious URLs"`.
+
+## How the fetch window works
+
+At the start of every run the playbook queries the `ThreatIntelIndicators` table for
+`max(Created)` of `SourceSystem == "PRODAFT USTA - Malicious URLs"` and uses that (minus a 5-minute safety
+overlap) as the `start=` of the fetch. Because a record only lands in that table after a
+**successful** upload, a failed run does not advance the watermark: the next run re-reads the
+same value and retries the missed window, so **no indicators are skipped on failure**. If the
+table has no USTA indicators yet (first run), it falls back to `LookBackHours`. The watermark
+query runs against `https://api.loganalytics.io` with the same managed identity and the same
+**Microsoft Sentinel Contributor** role used for the upload (that role already grants
+`Microsoft.OperationalInsights/workspaces/query/read`) — no extra role assignment is needed.
 
 ## Parameters
 
@@ -14,7 +26,7 @@ Indicators appear in the Threat Intelligence blade / `ThreatIntelIndicators` tab
 | `UstaBaseUrl` | no | `https://usta.prodaft.com` | USTA API base URL. |
 | `UstaApiKey` | **yes** | — | USTA long-lived API key (secured). |
 | `WorkspaceID` | **yes** | — | Log Analytics **workspace ID (GUID)** — workspace → *Overview*. |
-| `LookBackHours` | no | `2` | Sliding window fetched each run (small overlap over the hourly schedule; re-uploads are idempotent). |
+| `LookBackHours` | no | `2` | First-run / fallback look-back window (hours), used only until the first indicator is imported (empty watermark). Afterwards each run resumes from the import watermark. |
 
 ## Deploy — from the portal
 
@@ -64,7 +76,7 @@ az rest --method POST \
 
 ```kql
 ThreatIntelIndicators
-| where SourceSystem == "PRODAFT USTA"
+| where SourceSystem == "PRODAFT USTA - Malicious URLs"
 | where TimeGenerated > ago(1h)
 | sort by TimeGenerated desc
 | take 20
